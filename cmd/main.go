@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -15,11 +16,20 @@ import (
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 )
 
+var discoverBase *string
+
 func main() {
+
+	mqttAddr := flag.String("mqtt", "", "MQTT server, host:port")
+	usbPath := flag.String("device", "/dev/ttyUSB0", "USB device, fully qualified")
+	statusTopic := flag.String("statusTopic", "hass/status", "Home Assistant Birth/Will Topic")
+	discoverBase = flag.String("discoverBase", "homeassistant", "Home Assistant base discovery topic")
+
+	flag.Parse()
 
 	// MQTT
 	opts := MQTT.NewClientOptions()
-	opts.AddBroker(os.Args[1])
+	opts.AddBroker(*mqttAddr)
 	opts.SetClientID("concord")
 	opts.SetCleanSession(true)
 	client := MQTT.NewClient(opts)
@@ -29,14 +39,14 @@ func main() {
 
 	// Subscribe to hass status topic so we can rebroacast when hass comes up/down
 	status := make(chan [2]string)
-	if token := client.Subscribe("hass/status", 0, func(client MQTT.Client, msg MQTT.Message) {
+	if token := client.Subscribe(*statusTopic, 0, func(client MQTT.Client, msg MQTT.Message) {
 		status <- [2]string{msg.Topic(), string(msg.Payload())}
 	}); token.Wait() && token.Error() != nil {
 		panic(token.Error())
 	}
 
 	// Serial
-	c, err := concord.NewClient("/dev/ttyUSB0")
+	c, err := concord.NewClient(*usbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -75,7 +85,7 @@ loopbreak:
 
 	ticker.Stop()
 
-	if token := client.Unsubscribe("hass/status"); token.Wait() && token.Error() != nil {
+	if token := client.Unsubscribe(*statusTopic); token.Wait() && token.Error() != nil {
 		print(token.Error())
 	}
 
@@ -105,13 +115,13 @@ func publishZone(z *concord.Zone, client MQTT.Client) {
 		deviceClass = "motion"
 	}
 
-	configTopic := "homeassistant/binary_sensor/" + cid + "/config"
+	configTopic := *discoverBase + "/binary_sensor/" + cid + "/config"
 	configValue := "{\"name\": \"" + strings.Title(lowerName) + "\", \"device_class\": \"" + deviceClass + "\"}"
 
 	//client.Publish(configTopic, 0, true, "")
 	client.Publish(configTopic, 0, true, configValue)
 
-	stateTopic := "homeassistant/binary_sensor/" + cid + "/state"
+	stateTopic := *discoverBase + "/binary_sensor/" + cid + "/state"
 	stateValue := "OFF"
 	if z.Status != 0 {
 		stateValue = "ON"
@@ -121,7 +131,7 @@ func publishZone(z *concord.Zone, client MQTT.Client) {
 
 func updateZone(z *concord.Zone, client MQTT.Client) {
 	cid := fmt.Sprintf("concord_zone_%d", z.ID)
-	stateTopic := "homeassistant/binary_sensor/" + cid + "/state"
+	stateTopic := *discoverBase + "/binary_sensor/" + cid + "/state"
 	stateValue := "OFF"
 	if z.Status != 0 {
 		stateValue = "ON"
