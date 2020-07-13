@@ -10,6 +10,8 @@ import (
 
 	"fmt"
 
+	"encoding/json"
+
 	"strings"
 
 	"github.com/cicavey/concord"
@@ -92,6 +94,24 @@ loopbreak:
 	client.Disconnect(250)
 }
 
+func stateTopic(z concord.Zone) string {
+	cid := fmt.Sprintf("concord_zone_%d", z.ID)
+	return *discoverBase + "/binary_sensor/" + cid + "/state"
+}
+
+func stateValue(z concord.Zone) string {
+	if z.Status != 0 {
+		return "ON"
+	}
+	return "OFF"
+}
+
+type HAZoneConfig struct {
+	Name        string `json:"name"`
+	DeviceClass string `json:"device_class"`
+	StateTopic  string `json:"state_topic"`
+}
+
 func publishZone(z *concord.Zone, client MQTT.Client) {
 	/* created
 	homeassistant/binary_sensor/<ID>/config
@@ -116,27 +136,17 @@ func publishZone(z *concord.Zone, client MQTT.Client) {
 	}
 
 	configTopic := *discoverBase + "/binary_sensor/" + cid + "/config"
-	configValue := "{\"name\": \"" + strings.Title(lowerName) + "\", \"device_class\": \"" + deviceClass + "\"}"
 
-	//client.Publish(configTopic, 0, true, "")
-	client.Publish(configTopic, 0, true, configValue)
+	configValue := HAZoneConfig{Name:strings.Title(lowerName), DeviceClass: deviceClass, StateTopic: stateTopic(*z)}
 
-	stateTopic := *discoverBase + "/binary_sensor/" + cid + "/state"
-	stateValue := "OFF"
-	if z.Status != 0 {
-		stateValue = "ON"
-	}
-	client.Publish(stateTopic, 0, true, stateValue)
+	configRaw, _ := json.Marshal(configValue)
+	client.Publish(configTopic, 0, true, configRaw)
+
+	updateZone(z, client)
 }
 
 func updateZone(z *concord.Zone, client MQTT.Client) {
-	cid := fmt.Sprintf("concord_zone_%d", z.ID)
-	stateTopic := *discoverBase + "/binary_sensor/" + cid + "/state"
-	stateValue := "OFF"
-	if z.Status != 0 {
-		stateValue = "ON"
-	}
-	client.Publish(stateTopic, 0, true, stateValue)
+	client.Publish(stateTopic(*z), 0, true, stateValue(*z))
 }
 
 func setupSigHandler() chan bool {
