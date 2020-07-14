@@ -12,7 +12,7 @@ arm7:
 	GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-s -w -X main.BuildVersion=$(BUILD_VERSION) -X main.BuildDate=$(BUILD_DATE)" -o concord.arm7 cmd/*.go
 
 dist: default arm6 arm7
-	upx --brute concord*
+	upx --lzma concord*
 
 clean:
 	rm -f concord concord.*
