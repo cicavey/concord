@@ -15,14 +15,26 @@ import (
 
 	"github.com/cicavey/concord"
 	MQTT "github.com/eclipse/paho.mqtt.golang"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
 	log "github.com/sirupsen/logrus"
 )
 
+var BuildVersion string = "standalone"
+var BuildDate string = "now"
+
 var config *viper.Viper
 
 func main() {
+
+	version := pflag.BoolP("version", "v", false, "Show version")
+	pflag.Parse()
+
+	if *version {
+		fmt.Println(BuildVersion, BuildDate)
+		os.Exit(0)
+	}
 
 	localConfig, err := ResolveConfig()
 	if err != nil {
