@@ -16,13 +16,26 @@ const (
 type Client struct {
 	port       string
 	io         *serial.Port
-	ZoneMap    map[int]*Zone
 	writeQueue chan []byte
 	eventQueue chan Event
+
+	ZoneMap   map[int]*Zone
+	PanelType PanelType
+	HWVersion string
+	SWVersion string
+	Serial    string
 }
 
+type EventType int
+
+const (
+	EventTypeZoneDefined  EventType = 0
+	EventTypeZoneUpdated  EventType = 1
+	EventTypePanelDefined EventType = 2
+)
+
 type Event struct {
-	Type int
+	Type EventType
 	Zone *Zone
 }
 

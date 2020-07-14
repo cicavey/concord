@@ -1,8 +1,7 @@
 package main
 
 import (
-	"flag"
-	"log"
+	"crypto/tls"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,39 +15,61 @@ import (
 
 	"github.com/cicavey/concord"
 	MQTT "github.com/eclipse/paho.mqtt.golang"
+	"github.com/spf13/viper"
+
+	log "github.com/sirupsen/logrus"
 )
 
-var discoverBase *string
+var config *viper.Viper
 
 func main() {
 
-	mqttAddr := flag.String("mqtt", "", "MQTT server, host:port")
-	usbPath := flag.String("device", "/dev/ttyUSB0", "USB device, fully qualified")
-	statusTopic := flag.String("statusTopic", "hass/status", "Home Assistant Birth/Will Topic")
-	discoverBase = flag.String("discoverBase", "homeassistant", "Home Assistant base discovery topic")
+	localConfig, err := ResolveConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+	config = localConfig
 
-	flag.Parse()
+	if level, err := log.ParseLevel(config.GetString("log_level")); err == nil {
+		// Print directly so that log level changes are always visible
+		fmt.Println("Setting log level to", level)
+		log.SetLevel(level)
+	}
 
 	// MQTT
 	opts := MQTT.NewClientOptions()
-	opts.AddBroker(*mqttAddr)
-	opts.SetClientID("concord")
+	opts.AddBroker(config.GetString("mqtt.broker"))
+	opts.SetClientID(config.GetString("mqtt.client_id"))
 	opts.SetCleanSession(true)
+
+	mqttUser := config.GetString("mqtt.username")
+	if mqttUser != "" {
+		opts.SetUsername(mqttUser)
+		mqttPass := config.GetString("mqtt.password")
+		if mqttPass != "" {
+			opts.SetPassword(mqttPass)
+		}
+	}
+
+	// TODO: Add proper support for root CAs, client certs. Better than nothing
+	tlsConfig := &tls.Config{InsecureSkipVerify: true, ClientAuth: tls.NoClientCert}
+	opts.SetTLSConfig(tlsConfig)
+
 	client := MQTT.NewClient(opts)
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		panic(token.Error())
+		log.Fatal(token.Error())
 	}
 
 	// Subscribe to hass status topic so we can rebroacast when hass comes up/down
 	status := make(chan [2]string)
-	if token := client.Subscribe(*statusTopic, 0, func(client MQTT.Client, msg MQTT.Message) {
+	if token := client.Subscribe(config.GetString("homeassistant.status_topic"), 0, func(client MQTT.Client, msg MQTT.Message) {
 		status <- [2]string{msg.Topic(), string(msg.Payload())}
 	}); token.Wait() && token.Error() != nil {
-		panic(token.Error())
+		log.Fatal(token.Error())
 	}
 
 	// Serial
-	c, err := concord.NewClient(*usbPath)
+	c, err := concord.NewClient(config.GetString("device"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -58,28 +79,33 @@ func main() {
 
 	ticker := time.NewTicker(time.Second * 30)
 
+	publishAll := func() {
+		for _, z := range c.ZoneMap {
+			publishZone(c, z, client)
+		}
+	}
+
 loopbreak:
 	for {
 		select {
 		case evt := <-c.EventQueue():
-			if evt.Type == 0 {
-				publishZone(evt.Zone, client)
-			} else if evt.Type == 1 {
+			switch evt.Type {
+			case concord.EventTypeZoneDefined:
+				publishZone(c, evt.Zone, client)
+			case concord.EventTypeZoneUpdated:
 				updateZone(evt.Zone, client)
+			case concord.EventTypePanelDefined:
+				publishAll()
 			}
 		case msg := <-status:
-			fmt.Println(msg)
+			log.Info(msg)
 			if msg[1] == "online" {
 				// Rebroadcast Zones
-				for _, z := range c.ZoneMap {
-					publishZone(z, client)
-				}
+				publishAll()
 			}
 		case <-ticker.C:
-			fmt.Println("tick")
-			for _, z := range c.ZoneMap {
-				publishZone(z, client)
-			}
+			log.Info("tick, republish zones")
+			publishAll()
 		case <-done:
 			break loopbreak
 		}
@@ -87,8 +113,8 @@ loopbreak:
 
 	ticker.Stop()
 
-	if token := client.Unsubscribe(*statusTopic); token.Wait() && token.Error() != nil {
-		print(token.Error())
+	if token := client.Unsubscribe(config.GetString("homeassistant.status_topic")); token.Wait() && token.Error() != nil {
+		log.Warn(token.Error())
 	}
 
 	client.Disconnect(250)
@@ -96,7 +122,7 @@ loopbreak:
 
 func stateTopic(z concord.Zone) string {
 	cid := fmt.Sprintf("concord_zone_%d", z.ID)
-	return *discoverBase + "/binary_sensor/" + cid + "/state"
+	return config.GetString(ConfDiscoverBase) + "/binary_sensor/" + cid + "/state"
 }
 
 func stateValue(z concord.Zone) string {
@@ -106,24 +132,30 @@ func stateValue(z concord.Zone) string {
 	return "OFF"
 }
 
-type HAZoneConfig struct {
-	Name        string `json:"name"`
-	DeviceClass string `json:"device_class"`
-	StateTopic  string `json:"state_topic"`
+type hadevice struct {
+	Identifiers  string `json:"identifiers"`
+	Manufacturer string `json:"manufacturer"` // Interlogix
+	Model        string `json:"model"`        // hw_rev
+	Name         string `json:"name"`         // panel type
+	Version      string `json:"sw_version"`   // sw_ver
 }
 
-func publishZone(z *concord.Zone, client MQTT.Client) {
-	/* created
-	homeassistant/binary_sensor/<ID>/config
-	{"name": "garden", "device_class": "motion"}
+// This conforms to homeassistant's mqtt discovery definitions
+type haentity struct {
+	Name        string   `json:"name"`
+	DeviceClass string   `json:"device_class"`
+	StateTopic  string   `json:"state_topic"`
+	UniqueID    string   `json:"unique_id"`
+	Device      hadevice `json:"device"`
+}
 
-	device_class:
-	- motion (ON/OFF)
-	- opening (ON OPEN, OFF CLOSED)
+func publishZone(c *concord.Client, z *concord.Zone, client MQTT.Client) {
 
-	homeassistant/binary_sensor/<ID>/state
-	ON/OFF
-	*/
+	// Only bother publishing if the
+	if c.Serial == "" || c.SWVersion == "" || c.HWVersion == "" {
+		log.Warn("Attempt to publish zones without panel definition")
+		return
+	}
 
 	cid := fmt.Sprintf("concord_zone_%d", z.ID)
 
@@ -134,10 +166,28 @@ func publishZone(z *concord.Zone, client MQTT.Client) {
 	if strings.Contains(lowerName, "motion") {
 		deviceClass = "motion"
 	}
+	if strings.Contains(lowerName, "door") {
+		deviceClass = "door"
+	}
+	if strings.Contains(lowerName, "window") {
+		deviceClass = "window"
+	}
 
-	configTopic := *discoverBase + "/binary_sensor/" + cid + "/config"
+	configTopic := config.GetString(ConfDiscoverBase) + "/binary_sensor/" + cid + "/config"
 
-	configValue := HAZoneConfig{Name:strings.Title(lowerName), DeviceClass: deviceClass, StateTopic: stateTopic(*z)}
+	configValue := haentity{
+		Name:        strings.Title(lowerName),
+		DeviceClass: deviceClass,
+		StateTopic:  stateTopic(*z),
+		UniqueID:    c.Serial + "-" + cid,
+		Device: hadevice{
+			Identifiers:  c.Serial,
+			Manufacturer: "Interlogix",
+			Model:        c.HWVersion,
+			Name:         c.PanelType.String(),
+			Version:      c.SWVersion,
+		},
+	}
 
 	configRaw, _ := json.Marshal(configValue)
 	client.Publish(configTopic, 0, true, configRaw)
@@ -155,7 +205,7 @@ func setupSigHandler() chan bool {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigs
-		fmt.Println("Ctrl-C")
+		log.Info("Ctrl-C")
 		done <- true
 	}()
 	return done
